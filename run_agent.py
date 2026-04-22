@@ -7648,7 +7648,14 @@ class AIAgent:
         # This prevents thinking-capable models (Qwen3, etc.) from generating
         # <think> blocks and producing empty-response errors when the user has
         # set reasoning_effort: none.
-        if self.provider == "custom" and self.reasoning_config and isinstance(self.reasoning_config, dict):
+        # IMPORTANT: Google AI Studio and Vertex AI strictly reject ANY unknown
+        # field including "think": false with HTTP 400 INVALID_ARGUMENT.
+        # Only send this to Ollama-style local endpoints, not Google endpoints.
+        _is_google_endpoint = (
+            "generativelanguage.googleapis.com" in (self.base_url or "").lower()
+            or "aiplatform.googleapis.com" in (self.base_url or "").lower()
+        )
+        if self.provider == "custom" and not _is_google_endpoint and self.reasoning_config and isinstance(self.reasoning_config, dict):
             _effort = (self.reasoning_config.get("effort") or "").strip().lower()
             _enabled = self.reasoning_config.get("enabled", True)
             if _effort == "none" or _enabled is False:

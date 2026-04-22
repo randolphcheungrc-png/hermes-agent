@@ -763,6 +763,9 @@ class GeminiNativeClient:
     ) -> Any:
         thinking_config = None
         if isinstance(extra_body, dict):
+            # Strip any unknown top-level fields like 'think' that might be injected by 
+            # general-purpose reasoning proxies/gateways but are rejected by Vertex AI.
+            extra_body = {k: v for k, v in extra_body.items() if k != 'think'}
             thinking_config = extra_body.get("thinking_config") or extra_body.get("thinkingConfig")
 
         request = build_gemini_request(
