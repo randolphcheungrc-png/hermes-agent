@@ -13182,9 +13182,19 @@ class GatewayRunner:
                     with open(_file_path, "rb") as _fh:
                         _file_bytes = _fh.read()
                     _file_name = _os.path.basename(_file_path)
-                    _name_match = _re.search(r"The user sent a document: '([^']+)'", message_text)
-                    if _name_match:
-                        _file_name = _name_match.group(1)
+                    # Priority 1: sidecar .meta.json from bridge.js (original Unicode filename)
+                    _meta_path = _file_path + '.meta.json'
+                    if _os.path.exists(_meta_path):
+                        try:
+                            _meta = _json.loads(open(_meta_path, encoding='utf-8').read())
+                            _file_name = _meta.get('originalName') or _file_name
+                        except Exception:
+                            pass
+                    else:
+                        # Priority 2: display_name from context note (may have underscores for old files)
+                        _name_match = _re.search(r"The user sent a document: '([^']+)'", message_text)
+                        if _name_match:
+                            _file_name = _name_match.group(1)
 
                     # Use requests in executor so Chinese filenames survive multipart encoding
                     import requests as _requests

@@ -324,6 +324,8 @@ async function startSocket() {
           mkdirSync(IMAGE_CACHE_DIR, { recursive: true });
           const filePath = path.join(IMAGE_CACHE_DIR, `img_${randomBytes(6).toString('hex')}${ext}`);
           writeFileSync(filePath, buf);
+          // Write original filename sidecar so WeCom bypass can use real name
+          writeFileSync(filePath + '.meta.json', JSON.stringify({originalName: fileName}), 'utf8');
           mediaUrls.push(filePath);
         } catch (err) {
           console.error('[bridge] Failed to download image:', err.message);
