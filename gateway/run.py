@@ -13346,9 +13346,13 @@ class GatewayRunner:
                 for _attempt in range(3):
                     try:
                         if _job.get("type") == "text":
+                            _txt = _job["text"]
+                            # WeCom text webhook limit: 2048 bytes
+                            if len(_txt.encode("utf-8")) > 2048:
+                                _txt = _txt.encode("utf-8")[:2000].decode("utf-8", errors="ignore") + "…[訊息過長，已截斷]"
                             _r = _requests.post(
                                 _send_url,
-                                json={"msgtype": "text", "text": {"content": _job["text"]}},
+                                json={"msgtype": "text", "text": {"content": _txt}},
                                 timeout=15,
                             )
                             if _r.json().get("errcode", 0) == 0:
@@ -13360,26 +13364,39 @@ class GatewayRunner:
                             if not _qf.exists():
                                 _success = True   # already gone, skip
                                 break
-                            # WeCom webhook upload_media limit is 20 MB
-                            _WECOM_MAX_BYTES = 20 * 1024 * 1024
+                            # Detect WeCom media type + per-type size limit
+                            _ext = _Path(_qf.name).suffix.lower()
+                            if _ext in (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"):
+                                _media_type = "image";  _msg_key = "image";  _limit_mb = 10
+                            elif _ext in (".amr", ".mp3", ".wav", ".speex"):
+                                _media_type = "voice";  _msg_key = "voice";  _limit_mb = 2
+                            elif _ext in (".mp4",):
+                                _media_type = "video";  _msg_key = "video";  _limit_mb = 10
+                            else:
+                                _media_type = "file";   _msg_key = "file";   _limit_mb = 20
+                            _WECOM_LIMIT = _limit_mb * 1024 * 1024
                             _file_size = _qf.stat().st_size
                             _orig_name = _job.get("original_filename", _qf.name)
-                            if _file_size > _WECOM_MAX_BYTES:
+                            if _file_size > _WECOM_LIMIT:
                                 _size_mb = _file_size / (1024 * 1024)
                                 _requests.post(
                                     _send_url,
                                     json={"msgtype": "text", "text": {"content":
-                                        f"⚠️ 檔案 [{_orig_name}] 太大無法上傳至 WeCom（{_size_mb:.1f}MB > 20MB 限制）。請直接分享檔案。"}},
+                                        f"⚠️ 檔案 [{_orig_name}] 太大無法上傳至 WeCom（{_size_mb:.1f}MB > {_limit_mb}MB {_media_type} 限制）。請直接分享檔案。"}},
                                     timeout=15,
                                 )
                                 _rec_oversized = True
                                 _rec_size_mb   = _size_mb
                                 _success = True
                                 break
+                            _up_url = (
+                                f"https://qyapi.weixin.qq.com/cgi-bin/webhook/upload_media"
+                                f"?key={_webhook_key}&type={_media_type}"
+                            )
                             with open(_qf, "rb") as _fh:
                                 _file_bytes = _fh.read()
                             _up = _requests.post(
-                                _upload_url,
+                                _up_url,
                                 files={"media": (_orig_name, _file_bytes, "application/octet-stream")},
                                 timeout=30,
                             ).json()
@@ -13391,7 +13408,7 @@ class GatewayRunner:
                             _media_id = _up.get("media_id", "")
                             _r2 = _requests.post(
                                 _send_url,
-                                json={"msgtype": "file", "file": {"media_id": _media_id}},
+                                json={"msgtype": _msg_key, _msg_key: {"media_id": _media_id}},
                                 timeout=15,
                             )
                             if _r2.json().get("errcode", 0) == 0:
