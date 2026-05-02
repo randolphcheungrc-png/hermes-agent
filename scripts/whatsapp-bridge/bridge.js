@@ -366,7 +366,7 @@ async function startSocket() {
         try {
           const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
           mkdirSync(DOCUMENT_CACHE_DIR, { recursive: true });
-          const safeFileName = path.basename(fileName).replace(/[^a-zA-Z0-9._-]/g, '_');
+          const safeFileName = path.basename(fileName).replace(/[<>:\"\/\|?*\x00-\x1f]/g, '_');
           const filePath = path.join(DOCUMENT_CACHE_DIR, `doc_${randomBytes(6).toString('hex')}_${safeFileName}`);
           writeFileSync(filePath, buf);
           mediaUrls.push(filePath);
