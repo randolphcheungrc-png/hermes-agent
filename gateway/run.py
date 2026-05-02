@@ -13267,6 +13267,10 @@ class GatewayRunner:
         FILES_DIR  = QUEUE_DIR / "files"
         FAILED_DIR = QUEUE_DIR / "failed"
 
+        # batch summary tracking
+        _batch      = []   # [{type, name, ok, oversized, size_mb}]
+        _idle_since = None # when queue first became empty after processing work
+
         while True:
             try:
                 _jobs = sorted(QUEUE_DIR.glob("*.json"))
@@ -13275,8 +13279,45 @@ class GatewayRunner:
                 continue
 
             if not _jobs:
+                if _batch:
+                    if _idle_since is None:
+                        _idle_since = _time.time()
+                    elif (_time.time() - _idle_since) >= 10:
+                        # ── send batch summary ─────���──────────────────
+                        _n_total = len(_batch)
+                        _n_ok    = sum(1 for x in _batch if x["ok"])
+                        _n_big   = sum(1 for x in _batch if x["oversized"])
+                        _n_fail  = _n_total - _n_ok - _n_big
+                        _lines   = [f"📊 WeCom 轉發摘要 — 共 {_n_total} 項"]
+                        if _n_ok:   _lines.append(f"✅ 成功送出: {_n_ok} 項")
+                        if _n_big:  _lines.append(f"⚠️ 超過20MB（已發通知）: {_n_big} 項")
+                        if _n_fail: _lines.append(f"❌ 失敗: {_n_fail} 項")
+                        _fail_items = [x for x in _batch if not x["ok"]]
+                        if _fail_items:
+                            _lines.append("")
+                            for _x in _fail_items:
+                                _nm = _x["name"]
+                                if len(_nm) > 45: _nm = _nm[:42] + "..."
+                                if _x["oversized"]:
+                                    _lines.append(f"  • {_nm}（{_x['size_mb']}MB，超過20MB限制）")
+                                else:
+                                    _lines.append(f"  • {_nm}（上傳失敗，已移至 failed/）")
+                        _wk = _os.getenv("WECOM_WEBHOOK_KEY", "").strip()
+                        if _wk:
+                            try:
+                                _requests.post(
+                                    f"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={_wk}",
+                                    json={"msgtype": "text", "text": {"content": "\n".join(_lines)}},
+                                    timeout=15,
+                                )
+                            except Exception:
+                                pass
+                        _batch.clear()
+                        _idle_since = None
                 _time.sleep(1)
                 continue
+
+            _idle_since = None  # jobs present — reset idle timer
 
             for _job_path in _jobs:
                 try:
@@ -13299,7 +13340,9 @@ class GatewayRunner:
                     f"?key={_webhook_key}&type=file"
                 )
 
-                _success = False
+                _success       = False
+                _rec_oversized = False
+                _rec_size_mb   = 0.0
                 for _attempt in range(3):
                     try:
                         if _job.get("type") == "text":
@@ -13329,6 +13372,8 @@ class GatewayRunner:
                                         f"⚠️ 檔案 [{_orig_name}] 太大無法上傳至 WeCom（{_size_mb:.1f}MB > 20MB 限制）。請直接分享檔案。"}},
                                     timeout=15,
                                 )
+                                _rec_oversized = True
+                                _rec_size_mb   = _size_mb
                                 _success = True
                                 break
                             with open(_qf, "rb") as _fh:
@@ -13356,6 +13401,22 @@ class GatewayRunner:
                     except Exception:
                         if _attempt < 2:
                             _time.sleep(2)
+
+                # record result for batch summary
+                _jtype = _job.get("type", "file")
+                _jname = (
+                    (_job.get("text") or "")[:50].replace("\n", " ")
+                    if _jtype == "text"
+                    else (_job.get("original_filename")
+                          or _Path(_job.get("queued_file", "unknown")).name)
+                )
+                _batch.append({
+                    "type":      _jtype,
+                    "name":      _jname,
+                    "ok":        _success and not _rec_oversized,
+                    "oversized": _rec_oversized,
+                    "size_mb":   round(_rec_size_mb, 1),
+                })
 
                 if _success:
                     if _job.get("queued_file"):
