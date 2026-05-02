@@ -13317,9 +13317,22 @@ class GatewayRunner:
                             if not _qf.exists():
                                 _success = True   # already gone, skip
                                 break
+                            # WeCom webhook upload_media limit is 20 MB
+                            _WECOM_MAX_BYTES = 20 * 1024 * 1024
+                            _file_size = _qf.stat().st_size
+                            _orig_name = _job.get("original_filename", _qf.name)
+                            if _file_size > _WECOM_MAX_BYTES:
+                                _size_mb = _file_size / (1024 * 1024)
+                                _requests.post(
+                                    _send_url,
+                                    json={"msgtype": "text", "text": {"content":
+                                        f"⚠️ 檔案 [{_orig_name}] 太大無法上傳至 WeCom（{_size_mb:.1f}MB > 20MB 限制）。請直接分享檔案。"}},
+                                    timeout=15,
+                                )
+                                _success = True
+                                break
                             with open(_qf, "rb") as _fh:
                                 _file_bytes = _fh.read()
-                            _orig_name = _job.get("original_filename", _qf.name)
                             _up = _requests.post(
                                 _upload_url,
                                 files={"media": (_orig_name, _file_bytes, "application/octet-stream")},
