@@ -13113,18 +13113,24 @@ class GatewayRunner:
         """
         Short-circuit the LLM when WeCom forward mode is active.
         Uses WeCom Webhook API — no IP whitelist, no chatid needed.
-          - Text  → POST webhook/send  (msgtype=text)
-          - Files → POST webhook/upload_media → POST webhook/send (msgtype=file)
+          - Text  → enqueue job → worker POSTs webhook/send  (msgtype=text)
+          - Files → copy to queue/files/, capture Chinese name now
+                    → worker uploads + sends in order
         Magic words (WhatsApp only): "wecom start" / "wecom end"
         Returns None to let normal LLM path run when forward mode is off.
         """
         import json as _json
         import re as _re
         import os as _os
-        import asyncio as _asyncio
-        import aiohttp as _aiohttp
+        import shutil as _shutil
+        import time as _time
+        import uuid as _uuid
+        import threading as _threading
         from pathlib import Path as _Path
 
+        QUEUE_DIR  = _Path("/home/lighthouse/.hermes/wecom_queue")
+        FILES_DIR  = QUEUE_DIR / "files"
+        FAILED_DIR = QUEUE_DIR / "failed"
         STATE_FILE = _Path("/home/lighthouse/.hermes/state/current_task.json")
         TRIGGER_START = "wecom start"
         TRIGGER_END   = "wecom end"
@@ -13143,97 +13149,228 @@ class GatewayRunner:
             state["wecom_forward"] = fwd
             try:
                 STATE_FILE.write_text(_json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-            except Exception as _e:
+            except Exception:
                 pass
-            return "✓ WeCom forward mode ON"
+            self._ensure_wecom_worker()
+            return "\u2713 WeCom forward mode ON"
 
         if text_lower == TRIGGER_END:
             fwd["active"] = False
             state["wecom_forward"] = fwd
             try:
                 STATE_FILE.write_text(_json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-            except Exception as _e:
+            except Exception:
                 pass
-            return "✓ WeCom forward mode OFF"
+            return "\u2713 WeCom forward mode OFF"
 
         if not fwd.get("active"):
             return None  # forward mode off — let normal LLM path run
 
-        # ── Forward mode is ON ──────────────────────────────────────────────
+        # ── Forward mode is ON — enqueue the job ───────────────────────────
         webhook_key = _os.getenv("WECOM_WEBHOOK_KEY", "").strip()
         if not webhook_key:
-            return "⚠️ WECOM_WEBHOOK_KEY not configured"
+            return "\u26a0\ufe0f WECOM_WEBHOOK_KEY not configured"
 
-        webhook_send_url   = f"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={webhook_key}"
-        webhook_upload_url = f"https://qyapi.weixin.qq.com/cgi-bin/webhook/upload_media?key={webhook_key}&type=file"
+        # Ensure queue directories exist
+        for _d in (QUEUE_DIR, FILES_DIR, FAILED_DIR):
+            _d.mkdir(parents=True, exist_ok=True)
+
+        _ts_ms    = int(_time.time() * 1000)
+        _uid      = _uuid.uuid4().hex[:8]
+        _job_name = f"{_ts_ms}_{_uid}"
 
         _doc_match = _re.search(
             r"The file is saved at: (/.+?\.(?:pdf|docx?|xlsx?|pptx?|zip|txt|csv|png|jpg|jpeg|gif|mp4|mp3|wav))",
             message_text, _re.IGNORECASE
         )
 
-        try:
-            async with _aiohttp.ClientSession() as _session:
-                if _doc_match:
-                    _file_path = _doc_match.group(1).rstrip(".] ")
-                    if not _os.path.exists(_file_path):
-                        return f"⚠️ File not found: {_file_path}"
+        if _doc_match:
+            _file_path = _doc_match.group(1).rstrip(".] ")
+            if not _os.path.exists(_file_path):
+                return f"\u26a0\ufe0f File not found: {_file_path}"
 
-                    with open(_file_path, "rb") as _fh:
-                        _file_bytes = _fh.read()
-                    _file_name = _os.path.basename(_file_path)
-                    # Priority 1: sidecar .meta.json from bridge.js (original Unicode filename)
-                    _meta_path = _file_path + '.meta.json'
-                    if _os.path.exists(_meta_path):
+            # Capture original Chinese filename NOW before temp files are cleaned up
+            _file_name = _os.path.basename(_file_path)
+            _meta_path = _file_path + ".meta.json"
+            if _os.path.exists(_meta_path):
+                try:
+                    _meta = _json.loads(open(_meta_path, encoding="utf-8").read())
+                    _file_name = _meta.get("originalName") or _file_name
+                except Exception:
+                    pass
+            else:
+                _name_match = _re.search(r"The user sent a document: '([^']+)'", message_text)
+                if _name_match:
+                    _file_name = _name_match.group(1)
+
+            # Copy file into queue/files/ — temp path irrelevant at process time
+            _suffix      = _Path(_file_path).suffix
+            _queued_file = FILES_DIR / f"{_job_name}{_suffix}"
+            try:
+                _shutil.copy2(_file_path, _queued_file)
+            except Exception as _e:
+                return f"\u26a0\ufe0f Failed to queue file: {_e}"
+
+            _job = {
+                "ts":                _time.time(),
+                "type":              "file",
+                "queued_file":       str(_queued_file),
+                "original_filename": _file_name,
+                "sender":            getattr(source, "user_id", ""),
+            }
+        else:
+            _send_text = message_text.strip()
+            if not _send_text or _send_text == "[document received]":
+                return "\u2713"
+            _job = {
+                "ts":     _time.time(),
+                "type":   "text",
+                "text":   _send_text,
+                "sender": getattr(source, "user_id", ""),
+            }
+
+        # Write job file — timestamp prefix gives natural chronological sort
+        _job_file = QUEUE_DIR / f"{_job_name}.json"
+        _job_file.write_text(_json.dumps(_job, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        # Ensure background worker is running
+        self._ensure_wecom_worker()
+        return "\u2713"
+
+    def _ensure_wecom_worker(self):
+        """Start the WeCom queue worker thread if not already running."""
+        import threading as _threading
+        _worker = getattr(self, "_wecom_worker_thread", None)
+        if _worker is None or not _worker.is_alive():
+            _t = _threading.Thread(
+                target=self._wecom_queue_worker_loop,
+                daemon=True,
+                name="wecom-queue-worker",
+            )
+            _t.start()
+            self._wecom_worker_thread = _t
+
+    def _wecom_queue_worker_loop(self):
+        """
+        Background daemon thread — drains ~/.hermes/wecom_queue/ sequentially.
+        Jobs processed in filename (timestamp) order → guaranteed send order.
+        Retries 3x on failure then moves job + file to failed/.
+        0.5 s pause between items respects WeCom webhook rate limits.
+        """
+        import json as _json
+        import os as _os
+        import time as _time
+        import requests as _requests
+        from pathlib import Path as _Path
+
+        QUEUE_DIR  = _Path("/home/lighthouse/.hermes/wecom_queue")
+        FILES_DIR  = QUEUE_DIR / "files"
+        FAILED_DIR = QUEUE_DIR / "failed"
+
+        while True:
+            try:
+                _jobs = sorted(QUEUE_DIR.glob("*.json"))
+            except Exception:
+                _time.sleep(2)
+                continue
+
+            if not _jobs:
+                _time.sleep(1)
+                continue
+
+            for _job_path in _jobs:
+                try:
+                    _job = _json.loads(_job_path.read_text(encoding="utf-8"))
+                except Exception:
+                    try:
+                        _job_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    continue
+
+                _webhook_key = _os.getenv("WECOM_WEBHOOK_KEY", "").strip()
+                if not _webhook_key:
+                    _time.sleep(5)
+                    continue
+
+                _send_url   = f"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={_webhook_key}"
+                _upload_url = (
+                    f"https://qyapi.weixin.qq.com/cgi-bin/webhook/upload_media"
+                    f"?key={_webhook_key}&type=file"
+                )
+
+                _success = False
+                for _attempt in range(3):
+                    try:
+                        if _job.get("type") == "text":
+                            _r = _requests.post(
+                                _send_url,
+                                json={"msgtype": "text", "text": {"content": _job["text"]}},
+                                timeout=15,
+                            )
+                            if _r.json().get("errcode", 0) == 0:
+                                _success = True
+                                break
+
+                        else:  # file
+                            _qf = _Path(_job["queued_file"])
+                            if not _qf.exists():
+                                _success = True   # already gone, skip
+                                break
+                            with open(_qf, "rb") as _fh:
+                                _file_bytes = _fh.read()
+                            _orig_name = _job.get("original_filename", _qf.name)
+                            _up = _requests.post(
+                                _upload_url,
+                                files={"media": (_orig_name, _file_bytes, "application/octet-stream")},
+                                timeout=30,
+                            ).json()
+                            if _up.get("errcode", 0) != 0:
+                                if _attempt < 2:
+                                    _time.sleep(2)
+                                    continue
+                                break
+                            _media_id = _up.get("media_id", "")
+                            _r2 = _requests.post(
+                                _send_url,
+                                json={"msgtype": "file", "file": {"media_id": _media_id}},
+                                timeout=15,
+                            )
+                            if _r2.json().get("errcode", 0) == 0:
+                                _success = True
+                                break
+
+                    except Exception:
+                        if _attempt < 2:
+                            _time.sleep(2)
+
+                if _success:
+                    if _job.get("queued_file"):
                         try:
-                            _meta = _json.loads(open(_meta_path, encoding='utf-8').read())
-                            _file_name = _meta.get('originalName') or _file_name
+                            _Path(_job["queued_file"]).unlink(missing_ok=True)
                         except Exception:
                             pass
-                    else:
-                        # Priority 2: display_name from context note (may have underscores for old files)
-                        _name_match = _re.search(r"The user sent a document: '([^']+)'", message_text)
-                        if _name_match:
-                            _file_name = _name_match.group(1)
-
-                    # Use requests in executor so Chinese filenames survive multipart encoding
-                    import requests as _requests
-                    _loop = _asyncio.get_event_loop()
-                    def _do_upload():
-                        return _requests.post(
-                            webhook_upload_url,
-                            files={"media": (_file_name, _file_bytes, "application/octet-stream")},
-                        ).json()
-                    _up = await _loop.run_in_executor(None, _do_upload)
-
-                    if _up.get("errcode", 0) != 0:
-                        return f"⚠️ Upload failed: errcode {_up.get('errcode')}"
-                    _media_id = _up.get("media_id", "")
-
-                    def _do_send_file():
-                        return _requests.post(
-                            webhook_send_url,
-                            json={"msgtype": "file", "file": {"media_id": _media_id}},
-                        ).json()
-                    _result = await _loop.run_in_executor(None, _do_send_file)
-                    if _result.get("errcode", 0) != 0:
-                        return f"⚠️ Send failed: errcode {_result.get('errcode')}"
-                    return "✓"
-
+                    try:
+                        _job_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
                 else:
-                    _send_text = message_text.strip()
-                    if not _send_text or _send_text == "[document received]":
-                        return "✓"
-                    async with _session.post(webhook_send_url,
-                                             json={"msgtype": "text",
-                                                   "text": {"content": _send_text}}) as _resp:
-                        _result = await _resp.json(content_type=None)
-                    if _result.get("errcode", 0) != 0:
-                        return f"⚠️ Send failed: errcode {_result.get('errcode')}"
-                    return "✓"
+                    # Move to failed/ for manual inspection / replay
+                    try:
+                        _job_path.rename(FAILED_DIR / _job_path.name)
+                        if _job.get("queued_file"):
+                            _qf2 = _Path(_job["queued_file"])
+                            if _qf2.exists():
+                                _qf2.rename(FAILED_DIR / _qf2.name)
+                    except Exception:
+                        try:
+                            _job_path.unlink(missing_ok=True)
+                        except Exception:
+                            pass
 
-        except Exception as _e:
-            return f"⚠️ Webhook error: {_e}"
+                _time.sleep(0.5)   # rate-limit buffer between sends
+
+            _time.sleep(0.5)  # brief rest after draining a batch
 
     # ------------------------------------------------------------------
 
