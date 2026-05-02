@@ -6740,6 +6740,12 @@ class GatewayRunner:
             }
             await self.hooks.emit("agent:start", hook_ctx)
 
+            # WeCom forward mode bypass (WhatsApp → WeCom, no LLM)
+            if source.platform and source.platform.value == "whatsapp":
+                _fwd_response = await self._wecom_forward_bypass(message_text, source)
+                if _fwd_response is not None:
+                    return _fwd_response
+
             # Run the agent
             agent_result = await self._run_agent(
                 message=message_text,
@@ -13102,6 +13108,122 @@ class GatewayRunner:
             "session_id": session_id,
             "response_previewed": _stream_consumer is not None and bool(full_response),
         }
+
+    async def _wecom_forward_bypass(self, message_text: str, source) -> "Optional[str]":
+        """
+        Short-circuit the LLM when WeCom forward mode is active.
+        Uses WeCom Webhook API — no IP whitelist, no chatid needed.
+          - Text  → POST webhook/send  (msgtype=text)
+          - Files → POST webhook/upload_media → POST webhook/send (msgtype=file)
+        Magic words (WhatsApp only): "wecom start" / "wecom end"
+        Returns None to let normal LLM path run when forward mode is off.
+        """
+        import json as _json
+        import re as _re
+        import os as _os
+        import asyncio as _asyncio
+        import aiohttp as _aiohttp
+        from pathlib import Path as _Path
+
+        STATE_FILE = _Path("/home/lighthouse/.hermes/state/current_task.json")
+        TRIGGER_START = "wecom start"
+        TRIGGER_END   = "wecom end"
+
+        text_lower = (message_text or "").strip().lower()
+
+        try:
+            state = _json.loads(STATE_FILE.read_text(encoding="utf-8")) if STATE_FILE.exists() else {}
+        except Exception:
+            state = {}
+
+        fwd = state.get("wecom_forward", {})
+
+        if text_lower == TRIGGER_START:
+            fwd["active"] = True
+            state["wecom_forward"] = fwd
+            try:
+                STATE_FILE.write_text(_json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception as _e:
+                pass
+            return "✓ WeCom forward mode ON"
+
+        if text_lower == TRIGGER_END:
+            fwd["active"] = False
+            state["wecom_forward"] = fwd
+            try:
+                STATE_FILE.write_text(_json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception as _e:
+                pass
+            return "✓ WeCom forward mode OFF"
+
+        if not fwd.get("active"):
+            return None  # forward mode off — let normal LLM path run
+
+        # ── Forward mode is ON ──────────────────────────────────────────────
+        webhook_key = _os.getenv("WECOM_WEBHOOK_KEY", "").strip()
+        if not webhook_key:
+            return "⚠️ WECOM_WEBHOOK_KEY not configured"
+
+        webhook_send_url   = f"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={webhook_key}"
+        webhook_upload_url = f"https://qyapi.weixin.qq.com/cgi-bin/webhook/upload_media?key={webhook_key}&type=file"
+
+        _doc_match = _re.search(
+            r"The file is saved at: (/.+?\.(?:pdf|docx?|xlsx?|pptx?|zip|txt|csv|png|jpg|jpeg|gif|mp4|mp3|wav))",
+            message_text, _re.IGNORECASE
+        )
+
+        try:
+            async with _aiohttp.ClientSession() as _session:
+                if _doc_match:
+                    _file_path = _doc_match.group(1).rstrip(".] ")
+                    if not _os.path.exists(_file_path):
+                        return f"⚠️ File not found: {_file_path}"
+
+                    with open(_file_path, "rb") as _fh:
+                        _file_bytes = _fh.read()
+                    _file_name = _os.path.basename(_file_path)
+                    _name_match = _re.search(r"The user sent a document: '([^']+)'", message_text)
+                    if _name_match:
+                        _file_name = _name_match.group(1)
+
+                    # Use requests in executor so Chinese filenames survive multipart encoding
+                    import requests as _requests
+                    _loop = _asyncio.get_event_loop()
+                    def _do_upload():
+                        return _requests.post(
+                            webhook_upload_url,
+                            files={"media": (_file_name, _file_bytes, "application/octet-stream")},
+                        ).json()
+                    _up = await _loop.run_in_executor(None, _do_upload)
+
+                    if _up.get("errcode", 0) != 0:
+                        return f"⚠️ Upload failed: errcode {_up.get('errcode')}"
+                    _media_id = _up.get("media_id", "")
+
+                    def _do_send_file():
+                        return _requests.post(
+                            webhook_send_url,
+                            json={"msgtype": "file", "file": {"media_id": _media_id}},
+                        ).json()
+                    _result = await _loop.run_in_executor(None, _do_send_file)
+                    if _result.get("errcode", 0) != 0:
+                        return f"⚠️ Send failed: errcode {_result.get('errcode')}"
+                    return "✓"
+
+                else:
+                    _send_text = message_text.strip()
+                    if not _send_text or _send_text == "[document received]":
+                        return "✓"
+                    async with _session.post(webhook_send_url,
+                                             json={"msgtype": "text",
+                                                   "text": {"content": _send_text}}) as _resp:
+                        _result = await _resp.json(content_type=None)
+                    if _result.get("errcode", 0) != 0:
+                        return f"⚠️ Send failed: errcode {_result.get('errcode')}"
+                    return "✓"
+
+        except Exception as _e:
+            return f"⚠️ Webhook error: {_e}"
 
     # ------------------------------------------------------------------
 
